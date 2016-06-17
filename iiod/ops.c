@@ -59,7 +59,6 @@ struct DevEntry {
 
 	struct iio_device *dev;
 	struct iio_buffer *buf;
-	int buf_fd;
 	unsigned int sample_size, nb_clients;
 	bool update_mask;
 	bool cyclic;
@@ -509,9 +508,6 @@ static void * rw_thd(void *d)
 				break;
 			}
 
-			iio_buffer_set_blocking_mode(entry->buf, false);
-			entry->buf_fd = iio_buffer_get_poll_fd(entry->buf);
-
 			/* Signal the threads that we opened the device */
 			SLIST_FOREACH(thd, &entry->thdlist_head, dev_list_entry) {
 				if (thd->wait_for_open) {
@@ -561,25 +557,11 @@ static void * rw_thd(void *d)
 		 * to be sure that we don't lose samples. */
 		if (has_readers || had_readers) {
 			ssize_t nb_bytes;
-			struct pollfd pfd[2];
 
-			pfd[0].events = POLLIN;
-			pfd[0].fd = entry->buf_fd;
-			pfd[1].events = POLLIN;
-			pfd[1].fd = stop_fd;
-
-			do {
-				ret = poll(pfd, 2, -1);
-			} while (ret == -1 && errno == EINTR);
-
-			if ((pfd[1].revents & POLLIN) == 0) {
-				ret = iio_buffer_refill(entry->buf);
-				if (ret < 0)
-					ERROR("Reading from device failed: %i\n",
-							(int) ret);
-			} else {
-				ret = -EINTR;
-			}
+			ret = iio_buffer_refill(entry->buf);
+			if (ret < 0)
+				ERROR("Reading from device failed: %i\n",
+						(int) ret);
 
 			pthread_mutex_lock(&entry->thdlist_lock);
 
@@ -615,7 +597,6 @@ static void * rw_thd(void *d)
 
 		if (has_writers) {
 			ssize_t nb_bytes = 0;
-			struct pollfd pfd[2];
 
 			pthread_mutex_lock(&entry->thdlist_lock);
 
@@ -641,27 +622,13 @@ static void * rw_thd(void *d)
 					signal_thread(thd, ret);
 			}
 
-			pfd[0].events = POLLOUT;
-			pfd[0].fd = entry->buf_fd;
-			pfd[1].events = POLLIN;
-			pfd[1].fd = stop_fd;
-
-			do {
-				ret = poll(pfd, 2, -1);
-			} while (ret == -1 && errno == EINTR);
-
-			if ((pfd[1].revents & POLLIN) == 0) {
-				ret = iio_buffer_push_partial(entry->buf,
-					nb_bytes / sample_size);
-				if (ret < 0)
-					ERROR("Writing to device failed: %i\n",
-							(int) ret);
-			} else {
-				ret = -EINTR;
-			}
-
-			if (ret < 0)
+			ret = iio_buffer_push_partial(entry->buf,
+				nb_bytes / sample_size);
+			if (ret < 0) {
+				ERROR("Writing to device failed: %i\n",
+						(int) ret);
 				break;
+			}
 
 			/* Signal threads which completed their RW command */
 			for (thd = SLIST_FIRST(&entry->thdlist_head);
@@ -805,6 +772,10 @@ static void remove_thd_entry(struct ThdEntry *t)
 	if (!entry->closed) {
 		entry->update_mask = true;
 		SLIST_REMOVE(&entry->thdlist_head, t, ThdEntry, dev_list_entry);
+		if (SLIST_EMPTY(&entry->thdlist_head) && entry->buf) {
+			iio_buffer_cancel(entry->buf);
+			entry->closed = true;
+		}
 	}
 	pthread_mutex_unlock(&entry->thdlist_lock);
 	dev_entry_put(entry);
