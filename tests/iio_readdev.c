@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #define MY_NAME "iio_readdev"
 
@@ -73,19 +74,81 @@ static void quit_all(int sig)
 {
 	exit_code = sig;
 	app_running = false;
+	if (buffer)
+		iio_buffer_cancel(buffer);
 }
 
-static void set_handler(int signal_nb, void (*handler)(int))
-{
 #ifdef _WIN32
-	signal(signal_nb, handler);
-#else
-	struct sigaction sig;
-	sigaction(signal_nb, NULL, &sig);
-	sig.sa_handler = handler;
-	sigaction(signal_nb, &sig, NULL);
-#endif
+
+#include <Windows.h>
+
+BOOL WINAPI sig_handler_fn(DWORD dwCtrlType)
+{
+	/* Runs in its own thread */
+
+	switch (dwCtrlType) {
+	case CTRL_C_EVENT:
+	case CTRL_CLOSE_EVENT:
+		quit_all(SIGTERM);
+		return TRUE;
+	default:
+		return FALSE;
+	}
 }
+
+static setup_sig_handler(void)
+{
+	SetConsoleCtrlHandler(sig_handler_fn, TRUE);
+}
+
+#else
+
+#include <pthread.h>
+
+static void * sig_handler_thd(void *data)
+{
+	sigset_t *mask = data;
+	int ret;
+
+	/* Blocks until one of the termination signals is received */
+	do {
+		ret = sigwaitinfo(mask, NULL);
+	} while (ret == -1 && errno == EINTR);
+
+	quit_all(ret);
+
+	return NULL;
+}
+
+static void setup_sig_handler(void)
+{
+	sigset_t mask, oldmask;
+	pthread_t thd;
+	int ret;
+
+	/*
+	 * Async signals are difficult to handle and the IIO API is not signal
+	 * safe. Use a seperate thread and handle the signals synchronous so we
+	 * can call iio_buffer_cancel().
+	 */
+
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGHUP);
+	sigaddset(&mask, SIGPIPE);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGSEGV);
+	sigaddset(&mask, SIGTERM);
+
+	pthread_sigmask(SIG_BLOCK, &mask, &oldmask);
+
+	ret = pthread_create(&thd, NULL, sig_handler_thd, &mask);
+	if (ret) {
+		fprintf(stderr, "Failed to create signal handler thread: %d\n", ret);
+		pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+	}
+}
+
+#endif
 
 static struct iio_device * get_device(const struct iio_context *ctx,
 		const char *id)
@@ -175,6 +238,8 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	setup_sig_handler();
+
 	if (uri_index)
 		ctx = iio_create_context_from_uri(argv[uri_index]);
 	else if (ip_index)
@@ -189,15 +254,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Unable to create IIO context\n");
 		return EXIT_FAILURE;
 	}
-
-
-#ifndef _WIN32
-	set_handler(SIGHUP, &quit_all);
-	set_handler(SIGPIPE, &quit_all);
-#endif
-	set_handler(SIGINT, &quit_all);
-	set_handler(SIGSEGV, &quit_all);
-	set_handler(SIGTERM, &quit_all);
 
 	dev = get_device(ctx, argv[arg_index + 1]);
 	if (!dev) {
@@ -261,10 +317,11 @@ int main(int argc, char **argv)
 	while (app_running) {
 		int ret = iio_buffer_refill(buffer);
 		if (ret < 0) {
-			char buf[256];
-
-			iio_strerror(-ret, buf, sizeof(buf));
-			fprintf(stderr, "Unable to refill buffer: %s\n", buf);
+			if (app_running) {
+				char buf[256];
+				iio_strerror(-ret, buf, sizeof(buf));
+				fprintf(stderr, "Unable to refill buffer: %s\n", buf);
+			}
 			break;
 		}
 
