@@ -81,9 +81,9 @@ static int thd_entry_event_wait(struct ThdEntry *thd, pthread_mutex_t *mutex,
 	pfd[2].events = POLLIN;
 
 	do {
-		poll_nointr(pfd, 1);
+		poll_nointr(pfd, 3);
 
-		if ((pfd[1].revents & POLLRDHUP) || pfd[1].revents & POLLIN) {
+		if ((pfd[1].revents & POLLRDHUP) || (pfd[2].revents & POLLIN)) {
 			pthread_mutex_lock(mutex);
 			return -EPIPE;
 		}
